@@ -1,5 +1,5 @@
 /**
- *  Minoston Wallmote v2.0.0(HUBITAT)
+ *  Minoston Wallmote v2.0.1(HUBITAT)
  *
  *  	Models: Eva Logik (ZW924) / MINOSTON (MR40Z)
  *
@@ -10,6 +10,10 @@
  *	Documentation:
  *      Needs more testing, but it works.
  *  Changelog:
+ *
+ *    2.0.1 (03/28/2023)
+ *      - Code cleanup
+ *      - Fix SupervisionGet event  
  *
  *    2.0.0 (03/28/2023)
  *      - Remove Child Devices
@@ -52,7 +56,7 @@ import groovy.transform.Field
             0x59:3,	// AssociationGrpInfo         //AssociationGroupInfoReport
             0x85:3,	// Association                //AssociationReport
             0x80:1,	// Battery                    //BatteryReport
-            0x5B:1,	// CentralScene (3)           //CentralSceneNotification
+            0x5B:3,	// CentralScene (3)           //CentralSceneNotification
             0x70:4,	// Configuration              //ConfigurationReport
             0x5A:1,	// DeviceResetLocally         //DeviceResetLocallyNotification
             0x7A:5,	// Firmware Update Md (3)     //FirmwareMdReport        
@@ -149,6 +153,8 @@ metadata {
     }
 }
 
+
+
 void installed() {
     if (enableDebug) log.debug "installed"
 
@@ -160,22 +166,17 @@ void installed() {
 void updated() {
     if (!isDuplicateCommand(state.lastUpdated, 2000)) {
         state.lastUpdated = new Date().time
-
         if (enableDebug) log.debug "updated"
-        
         initialize()
-
         if (pendingChanges) {
             logForceWakeupMessage "The setting changes will be sent to the device the next time it wakes up."
         }
-
         refreshSyncStatus()
     }
 }
 
 void configure() {
     if (enableDebug) log.debug "configure()..."
-
     sendCommands(getConfigureCmds())
 }
 
@@ -186,23 +187,19 @@ List<String> getConfigureCmds() {
     if (changes) {
         log.warn "Syncing ${changes} Change(s)"
     }
-
     if (state.refreshAll || !device.currentValue("firmwareVersion")) {
         if (enableDebug) log.debug "Requesting Version Report"
         cmds << secureCmd(zwave.versionV3.versionGet())
     }
-
     if (state.refreshAll || !device.currentValue("battery")) {
         if (enableDebug) log.debug "Requesting Battery Report"
         cmds << secureCmd(zwave.batteryV1.batteryGet())
     }
-
     if (state.wakeUpInterval != wakeUpInterval) {
         if (enableDebug) log.debug "Setting Wake Up Interval to ${wakeUpInterval} Seconds"
-        cmds << secureCmd(zwave.wakeUpV1.wakeUpIntervalSet(seconds:wakeUpInterval, nodeid:zwaveHubNodeId))
-        cmds << secureCmd(zwave.wakeUpV1.wakeUpIntervalGet())
+        cmds << secureCmd(zwave.wakeUpV2.wakeUpIntervalSet(seconds:wakeUpInterval, nodeid:zwaveHubNodeId))
+        cmds << secureCmd(zwave.wakeUpV2.wakeUpIntervalGet())
     }
-
     configParams.each { param ->
         Integer storedVal = getParamStoredValue(param.num)
         if (state.refreshAll || storedVal != param.value) {
@@ -211,9 +208,7 @@ List<String> getConfigureCmds() {
             cmds << secureCmd(zwave.configurationV4.configurationGet(parameterNumber: param.num))
         }
     }
-
     cmds += getConfigureAssocsCmds()
-
     state.refreshAll = false
 
     return cmds
@@ -294,14 +289,45 @@ void parse(String description){
     updateLastCheckIn()
 }
 
+
+void zwaveEvent(hubitat.zwave.commands.supervisionv1.SupervisionGet cmd) {
+   hubitat.zwave.Command encapCmd = cmd.encapsulatedCommand(commandClassVersions)
+   if (encapCmd) {
+      zwaveEvent(encapCmd)
+   }
+   sendHubCommand(new hubitat.device.HubAction(
+      zwaveSecureEncap(zwave.supervisionV1.supervisionReport(sessionID: cmd.sessionID,
+         reserved: 0, moreStatusUpdates: false, status: 0xFF, duration: 0)),
+         hubitat.device.Protocol.ZWAVE)
+   )
+}
+
+def zwaveEvent(hubitat.zwave.commands.securityv1.SecurityMessageEncapsulation cmd) {
+    def encapsulatedCommand = cmd.encapsulatedCommand(commandClassVersions)
+    if (encapsulatedCommand) {
+        state.sec = 1
+        zwaveEvent(encapsulatedCommand)
+    }
+}
+
+String secureCmd(cmd) {
+    try {
+        if (getDataValue("zwaveSecurePairingComplete") == "true") {
+            return zwaveSecureEncap(cmd.format())
+        } else {
+            return cmd.format()
+        }
+    } catch (ex) {
+        log.error "secureCmd throw  $ex"
+    }
+}
+
 void zwaveEvent(hubitat.zwave.commands.wakeupv2.WakeUpIntervalReport cmd) {
     log.info "WakeUpIntervalReport:${cmd}"
     runIn(3, refreshSyncStatus)
     state.wakeUpInterval = cmd.seconds
-
     // Set the Health Check interval so that it can be skipped twice plus 5 minutes.
     def checkInterval = ((cmd.seconds * 2) + (5 * 60))
-
     sendEvent(name: "checkInterval", value: checkInterval, displayed: false, data: [protocol: "zwave", hubHardwareId: device.hub.hardwareID])
 }
 
@@ -328,18 +354,15 @@ void zwaveEvent(hubitat.zwave.commands.configurationv4.ConfigurationReport cmd) 
 
 void zwaveEvent(hubitat.zwave.commands.associationv3.AssociationReport cmd) {
     log.info "AssociationReport:${cmd}"
-
     runIn(3, refreshSyncStatus)
-
     if (enableDebug) log.debug "Group ${cmd.groupingIdentifier} Association: ${cmd.nodeId}"
-
     if( cmd.nodeId &&  cmd.nodeId != []){
         saveGroupAssociations(cmd.groupingIdentifier, cmd.nodeId)
     }
 }
 
 void zwaveEvent(hubitat.zwave.commands.versionv3.VersionReport cmd) {
-   if (logEnable) log.debug "VersionReport: ${cmd}"
+   if (enableDebug) log.debug "VersionReport: ${cmd}"
    device.updateDataValue("firmwareVersion", """${cmd.firmware0Version}.${String.format("%02d", cmd.firmware0SubVersion)}""")
    device.updateDataValue("protocolVersion", "${cmd.zWaveProtocolVersion}.${cmd.zWaveProtocolSubVersion}")
    device.updateDataValue("hardwareVersion", "${cmd.hardwareVersion}")
@@ -538,13 +561,7 @@ static Integer safeToInt(val, Integer defaultVal=0) {
     }
 }
 
-def zwaveEvent(hubitat.zwave.commands.securityv1.SecurityMessageEncapsulation cmd) {
-    def encapsulatedCommand = cmd.encapsulatedCommand(commandClassVersions)
-    if (encapsulatedCommand) {
-        state.sec = 1
-        zwaveEvent(encapsulatedCommand)
-    }
-}
+
 
 void zwaveEvent(hubitat.zwave.commands.manufacturerspecificv2.ManufacturerSpecificReport cmd) {
     log.info "ManufacturerSpecificReport:${cmd}"
@@ -629,20 +646,8 @@ void sendCommands(List<String> cmds, Integer delay=300) {
     }
 }
 
-String secureCmd(cmd) {
-    try {
-        if (getDataValue("zwaveSecurePairingComplete") == "true") {
-            return zwaveSecureEncap(cmd.format())
-        } else {
-            return cmd.format()
-        }
-    } catch (ex) {
-        log.error "secureCmd throw  $ex"
-    }
-}
-
-void zwaveEvent(hubitat.zwave.commands.centralscenev1.CentralSceneNotification cmd){
-    if (logEnable) log.debug "CentralSceneNotification: ${cmd}"
+void zwaveEvent(hubitat.zwave.commands.centralscenev3.CentralSceneNotification cmd){
+    if (enableDebug) log.debug "CentralSceneNotification: ${cmd}"
     // Which button was selected
     short button_id = cmd.sceneNumber
     // How was it selected
@@ -673,11 +678,11 @@ void zwaveEvent(hubitat.zwave.commands.centralscenev1.CentralSceneNotification c
 }
 
 /************************************** Addon codes Start ******************************************************************/
-void zwaveEvent(hubitat.zwave.commands.associationgrpinfov1.AssociationGroupInfoReport cmd) {
+void zwaveEvent(hubitat.zwave.commands.associationgrpinfov3.AssociationGroupInfoReport cmd) {
     log.info "AssociationGroupInfoReport:${cmd}"
     def cmds = []
     for (def i = 2; i <= state.groups; i++) {
-        cmds << response(zwave.multiChannelAssociationV2.multiChannelAssociationSet(groupingIdentifier:i, nodeId:zwaveHubNodeId))
+        cmds << response(zwave.multiChannelAssociationV3.multiChannelAssociationSet(groupingIdentifier:i, nodeId:zwaveHubNodeId))
     }
     sendCommands(cmds)
 }
@@ -694,14 +699,14 @@ void zwaveEvent(hubitat.zwave.commands.firmwareupdatemdv2.FirmwareMdReport cmd) 
     log.info "FirmwareMdReport:${cmd}"
 }
 
-void zwaveEvent(hubitat.zwave.commands.multichannelassociationv2.MultiChannelAssociationReport cmd) {
+void zwaveEvent(hubitat.zwave.commands.multichannelassociationv3.MultiChannelAssociationReport cmd) {
     log.info "MultiChannelAssociationReport:${cmd}"
     def cmds = []
     if (cmd.groupingIdentifier == 1) {
         if (cmd.nodeId != [0, zwaveHubNodeId, 1]) {
             log.debug "${device.displayName} - incorrect MultiChannel Association for Group 1! nodeId: ${cmd.nodeId} will be changed to [0, ${zwaveHubNodeId}, 1]"
-            cmds << zwave.multiChannelAssociationV2.multiChannelAssociationRemove(groupingIdentifier: 1)
-            cmds << zwave.multiChannelAssociationV2.multiChannelAssociationSet(groupingIdentifier: 1, nodeId: [0,zwaveHubNodeId,1])
+            cmds << zwave.multiChannelAssociationV3.multiChannelAssociationRemove(groupingIdentifier: 1)
+            cmds << zwave.multiChannelAssociationV3.multiChannelAssociationSet(groupingIdentifier: 1, nodeId: [0,zwaveHubNodeId,1])
         } else {
             logging("${device.displayName} - MultiChannel Association for Group 1 correct.","info")
         }
@@ -709,11 +714,4 @@ void zwaveEvent(hubitat.zwave.commands.multichannelassociationv2.MultiChannelAss
     sendCommands(cmds, 1000)
 }
 
-void zwaveEvent(hubitat.zwave.commands.supervisionv1.SupervisionGet cmd){
-    hubitat.zwave.Command encapCmd = cmd.encapsulatedCommand(commandClassVersions)
-    if (encapCmd) {
-        zwaveEvent(encapCmd)
-    }
-    sendHubCommand(new hubitat.device.HubAction(command(zwave.supervisionV1.supervisionReport(sessionID: cmd.sessionID, reserved: 0, moreStatusUpdates: false, status: 0xFF, duration: 0)), hubitat.device.Protocol.ZWAVE))
-}
 /************************************** Addon codes Over ******************************************************************/
